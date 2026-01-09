@@ -3,7 +3,7 @@ import os
 import requests
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import PeerUser, PeerChannel, PeerChat
+from telethon.tl.types import PeerUser, PeerChannel, PeerChat, InputMediaContact
 from telethon.tl.functions.messages import GetDialogsRequest, GetDialogFiltersRequest
 from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
 from telethon.tl.types import InputPhoneContact
@@ -112,6 +112,14 @@ class AddContactReq(BaseModel):
     phone: str
     first_name: str = "Contact"
     last_name: str = ""
+
+# ==================== НОВАЯ МОДЕЛЬ: отправка контакта как вложения ====================
+class SendContactAttachmentReq(BaseModel):
+    account: str
+    chat_id: Union[str, int]  # Куда отправлять
+    contact_id: Union[str, int]  # ID контакта для отправки
+    caption: Optional[str] = ""  # Подпись к контакту
+    force_lookup: bool = False  # Принудительный поиск контакта по ID
 
 # ==================== Вспомогательные функции ====================
 def extract_folder_title(folder_obj):
@@ -400,7 +408,147 @@ def list_accounts():
     return {"active_accounts": list(ACTIVE_CLIENTS.keys())}
 
 
-# ==================== НОВЫЙ ЭНДПОИНТ: Отправка сообщения новому пользователю ====================
+# ==================== НОВЫЙ ЭНДПОИНТ: Отправка контакта как вложения ====================
+@app.post("/send_contact_attachment")
+async def send_contact_attachment(req: SendContactAttachmentReq):
+    """
+    Отправить существующий контакт как вложение.
+    Контакт должен быть в контактах аккаунта.
+    Не создает новый контакт, только отправляет существующий.
+    """
+    client = ACTIVE_CLIENTS.get(req.account)
+    if not client:
+        raise HTTPException(400, detail=f"Аккаунт не найден: {req.account}")
+
+    try:
+        print(f"🔍 Ищу контакт с ID: {req.contact_id}")
+        
+        # 1. Пробуем получить контакт по ID
+        contact_entity = None
+        
+        try:
+            contact_entity = await client.get_entity(int(req.contact_id))
+            print(f"✅ Контакт найден через get_entity: {contact_entity}")
+        except Exception as e:
+            print(f"⚠️ Не удалось найти контакт через get_entity: {e}")
+            
+            if req.force_lookup:
+                # 2. Если force_lookup=True, ищем контакт в списке контактов
+                print("🔄 Принудительный поиск контакта...")
+                try:
+                    contacts = await client.get_contacts()
+                    for contact in contacts:
+                        if str(contact.id) == str(req.contact_id):
+                            contact_entity = contact
+                            print(f"✅ Контакт найден в списке контактов: {contact_entity}")
+                            break
+                    
+                    if not contact_entity:
+                        # 3. Ищем в диалогах
+                        dialogs = await client.get_dialogs(limit=100)
+                        for dialog in dialogs:
+                            if str(dialog.entity.id) == str(req.contact_id):
+                                contact_entity = dialog.entity
+                                print(f"✅ Контакт найден в диалогах: {contact_entity}")
+                                break
+                except Exception as e:
+                    print(f"❌ Ошибка при поиске контакта: {e}")
+        
+        if not contact_entity:
+            raise HTTPException(404, detail=f"Контакт с ID {req.contact_id} не найден. "
+                                         f"Убедитесь что контакт существует в аккаунте {req.account}")
+        
+        # Проверяем что это пользователь (а не группа/канал)
+        if not hasattr(contact_entity, 'first_name'):
+            raise HTTPException(400, detail=f"ID {req.contact_id} не является пользователем")
+        
+        # 4. Получаем необходимые данные для создания InputMediaContact
+        phone_number = getattr(contact_entity, 'phone', None)
+        first_name = getattr(contact_entity, 'first_name', '')
+        last_name = getattr(contact_entity, 'last_name', '')
+        
+        if not phone_number:
+            # Если номера нет в entity, пробуем получить через get_full_user
+            try:
+                full_user = await client.get_entity(contact_entity)
+                phone_number = getattr(full_user, 'phone', None)
+            except:
+                pass
+        
+        if not phone_number:
+            raise HTTPException(400, detail=f"Не удалось получить номер телефона для контакта {req.contact_id}")
+        
+        # 5. Создаем InputMediaContact
+        contact_media = InputMediaContact(
+            phone_number=str(phone_number),
+            first_name=first_name or "Contact",
+            last_name=last_name or "",
+            vcard=""
+        )
+        
+        # 6. Отправляем контакт как медиа-вложение
+        print(f"📤 Отправляю контакт {contact_entity.id} в чат {req.chat_id}")
+        
+        try:
+            # Получаем entity чата для отправки
+            chat_entity = await client.get_entity(req.chat_id)
+            
+            # Отправляем контакт
+            message = await client.send_file(
+                entity=chat_entity,
+                file=contact_media,
+                caption=req.caption if req.caption else None,
+                parse_mode=None
+            )
+            
+            print(f"✅ Контакт успешно отправлен! ID сообщения: {message.id}")
+            
+            # 7. Формируем информацию о контакте
+            contact_info = {
+                "id": contact_entity.id,
+                "phone": phone_number,
+                "first_name": first_name,
+                "last_name": last_name,
+                "username": getattr(contact_entity, 'username', None),
+                "access_hash": getattr(contact_entity, 'access_hash', None)
+            }
+            
+            return {
+                "status": "contact_sent",
+                "account": req.account,
+                "chat_id": req.chat_id,
+                "message_id": message.id,
+                "contact": contact_info,
+                "caption": req.caption,
+                "timestamp": datetime.now().isoformat(),
+                "details": {
+                    "method": "media_attachment",
+                    "force_lookup_used": req.force_lookup,
+                    "is_in_contacts": hasattr(contact_entity, 'contact') and contact_entity.contact
+                }
+            }
+            
+        except FloodWaitError as e:
+            raise HTTPException(429, detail=f"Ограничение Telegram: ждите {e.seconds} секунд")
+            
+        except Exception as e:
+            error_msg = str(e)
+            if "PEER_ID_INVALID" in error_msg:
+                raise HTTPException(400, detail=f"Неверный ID чата: {req.chat_id}")
+            elif "CHAT_WRITE_FORBIDDEN" in error_msg:
+                raise HTTPException(403, detail="Нет прав на отправку сообщений в этот чат")
+            else:
+                raise HTTPException(500, detail=f"Ошибка отправки контакта: {error_msg}")
+                
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(400, detail=f"Неверный формат ID: {str(e)}")
+    except Exception as e:
+        raise HTTPException(500, detail=f"Неожиданная ошибка: {str(e)}")
+
+
+# ==================== НОВЫЙ ЭНДПОИНТ: отправка новым пользователям ====================
 @app.post("/send_to_new_user")
 async def send_to_new_user(req: SendToNewUserReq):
     """
@@ -676,7 +824,7 @@ async def export_members(req: ExportMembersReq):
                 "is_fake": p.fake if hasattr(p, 'fake') else False,
                 "is_support": p.support if hasattr(p, 'support') else False,
                 "is_premium": p.premium if hasattr(p, 'premium') else False,
-            }
+            ]
             
             # Добавляем статус (онлайн/офлайн)
             if hasattr(p, 'status'):
@@ -853,6 +1001,3 @@ async def get_chat_history(req: GetChatHistoryReq):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("telegram_bot:app", host="0.0.0.0", port=port, reload=False)
-
-
-
