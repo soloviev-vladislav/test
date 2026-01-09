@@ -742,7 +742,62 @@ async def send_contact(req: SendContactReq):
             raise HTTPException(500, detail=f"Ошибка отправки контакта: {error_msg}")
 
 
+# ==================== НОВЫЙ ЭНДПОИНТ: Отправить контакт (самый простой способ) ====================
+@app.post("/send_contact_simple")
+async def send_contact_simple(req: SendContactReq):
+    """
+    Самый простой способ отправить контакт.
+    Требует явного указания телефона, имени и фамилии.
+    """
+    client = ACTIVE_CLIENTS.get(req.account)
+    if not client:
+        raise HTTPException(400, detail=f"Аккаунт не найден: {req.account}")
 
+    try:
+        # 1. Проверяем обязательные поля
+        if not req.phone:
+            raise HTTPException(400, detail="Параметр 'phone' обязателен")
+        if not req.first_name:
+            raise HTTPException(400, detail="Параметр 'first_name' обязателен")
+        
+        # 2. Получаем сущность чата
+        chat_entity = await client.get_entity(req.chat_id)
+        
+        # 3. Создаем InputMediaContact
+        from telethon.tl.types import InputMediaContact
+        
+        media_contact = InputMediaContact(
+            phone_number=req.phone,
+            first_name=req.first_name,
+            last_name=req.last_name,
+            vcard=''
+        )
+        
+        # 4. Отправляем сообщение
+        result = await client.send_message(
+            entity=chat_entity,
+            message=req.message if req.message else "",
+            file=media_contact
+        )
+        
+        return {
+            "status": "success",
+            "account": req.account,
+            "chat_id": req.chat_id,
+            "contact": {
+                "phone": req.phone,
+                "first_name": req.first_name,
+                "last_name": req.last_name
+            },
+            "message": {
+                "id": result.id,
+                "text": req.message
+            }
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        raise HTTPException(500, detail=f"Ошибка отправки контакта: {error_msg}")
    
 # ==================== Остальные эндпоинты (без изменений) ====================
 async def incoming_handler(event):
@@ -1009,6 +1064,7 @@ async def get_chat_history(req: GetChatHistoryReq):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("telegram_bot:app", host="0.0.0.0", port=port, reload=False)
+
 
 
 
