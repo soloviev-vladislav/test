@@ -1,6 +1,13 @@
 # telegram_bot.py — Мультиаккаунт + экспорт участников группы + мгновенная работа с любыми ID
 import os
 import requests
+from telethon.tl.functions.messages import SendMediaRequest
+from telethon.tl.types import (
+    InputMediaContact, 
+    InputPeerContact,
+    InputPhoneContact,
+    InputUser
+)
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import PeerUser, PeerChannel, PeerChat
@@ -598,54 +605,62 @@ async def add_contact(req: AddContactReq):
             raise HTTPException(500, detail=f"Ошибка добавления контакта: {error_msg}")
 
 
-# ==================== НОВЫЙ ЭНДПОИНТ: Отправить контакт как вложение ====================
-@app.post("/send_contact")
-async def send_contact(req: SendContactReq):
+# ==================== НОВЫЙ ЭНДПОИНТ: Отправить контакт (простой способ) ====================
+@app.post("/send_contact_simple")
+async def send_contact_simple(req: SendContactReq):
     """
-    Отправить существующий контакт как вложение в чат.
-    Контакт должен существовать в контактах аккаунта.
+    Простой способ отправки контакта через встроенный метод.
     """
     client = ACTIVE_CLIENTS.get(req.account)
     if not client:
         raise HTTPException(400, detail=f"Аккаунт не найден: {req.account}")
 
     try:
-        # 1. Получаем информацию о контакте
-        print(f"🔍 Ищу контакт с ID: {req.contact_id}")
-        
+        # 1. Получаем контакт
         try:
-            # Пробуем получить контакт по ID
-            contact_entity = await client.get_entity(int(req.contact_id))
-        except ValueError:
-            # Если ID не число, пробуем как username
-            contact_entity = await client.get_entity(req.contact_id)
+            if isinstance(req.contact_id, str) and req.contact_id.lstrip('-').isdigit():
+                contact_entity = await client.get_entity(int(req.contact_id))
+            else:
+                contact_entity = await client.get_entity(req.contact_id)
         except Exception as e:
             raise HTTPException(400, detail=f"Не удалось найти контакт: {str(e)}")
         
-        # 2. Проверяем, что это пользователь (контакт)
-        if not hasattr(contact_entity, 'user_id') and not hasattr(contact_entity, 'id'):
-            raise HTTPException(400, detail="Найденная сущность не является контактом")
+        # 2. Получаем данные контакта
+        contact_id = contact_entity.id
+        contact_first_name = req.first_name or getattr(contact_entity, 'first_name', '')
+        contact_last_name = req.last_name or getattr(contact_entity, 'last_name', '')
+        contact_phone = req.phone or getattr(contact_entity, 'phone', '')
         
-        # 3. Подготавливаем информацию о контакте
-        contact_info = {
-            'first_name': req.first_name or getattr(contact_entity, 'first_name', ''),
-            'last_name': req.last_name or getattr(contact_entity, 'last_name', ''),
-            'phone': req.phone or getattr(contact_entity, 'phone', '')
-        }
+        # 3. Если нет телефона, ищем в контактах
+        if not contact_phone:
+            try:
+                contacts = await client.get_contacts()
+                for contact in contacts:
+                    if contact.id == contact_id:
+                        contact_phone = contact.phone
+                        if not contact_first_name:
+                            contact_first_name = contact.first_name
+                        if not contact_last_name:
+                            contact_last_name = contact.last_name or ''
+                        break
+            except:
+                pass
         
-        print(f"📇 Отправляю контакт: {contact_info['first_name']} {contact_info['last_name']}")
+        if not contact_phone:
+            raise HTTPException(400, detail="Не удалось получить номер телефона контакта")
         
-        # 4. Отправляем контакт как вложение
-        result = await client.send_file(
+        print(f"📇 Отправляю контакт: {contact_first_name} {contact_last_name}")
+        
+        # 4. Используем метод send_contact (самый простой способ)
+        result = await client.send_contact(
             entity=req.chat_id,
-            file=contact_entity,
-            caption=req.message if req.message else None
+            phone=contact_phone,
+            first_name=contact_first_name,
+            last_name=contact_last_name,
+            message=req.message if req.message else None
         )
         
-        # 5. Получаем информацию об отправленном сообщении
-        message_id = None
-        if hasattr(result, 'id'):
-            message_id = result.id
+        message_id = result.id if hasattr(result, 'id') else None
         
         print(f"✅ Контакт успешно отправлен! Сообщение ID: {message_id}")
         
@@ -654,15 +669,15 @@ async def send_contact(req: SendContactReq):
             "account": req.account,
             "chat_id": req.chat_id,
             "contact": {
-                "id": getattr(contact_entity, 'id', req.contact_id),
-                "first_name": contact_info['first_name'],
-                "last_name": contact_info['last_name'],
-                "phone": contact_info['phone'],
+                "id": contact_id,
+                "first_name": contact_first_name,
+                "last_name": contact_last_name,
+                "phone": contact_phone,
                 "username": getattr(contact_entity, 'username', None)
             },
             "message": {
                 "id": message_id,
-                "text": req.message,
+                "text": req.message if req.message else "",
                 "has_caption": bool(req.message)
             },
             "timestamp": datetime.now().isoformat()
@@ -677,11 +692,11 @@ async def send_contact(req: SendContactReq):
             raise HTTPException(400, detail="Неверный ID пользователя. Контакт не найден.")
         elif "PEER_ID_INVALID" in error_msg:
             raise HTTPException(400, detail="Неверный ID чата.")
-        elif "INPUT_USER_DEACTIVATED" in error_msg:
-            raise HTTPException(400, detail="Пользователь удалил свой аккаунт.")
+        elif "PHONE_NOT_OCCUPIED" in error_msg:
+            raise HTTPException(400, detail="Номер телефона не зарегистрирован в Telegram.")
         else:
             raise HTTPException(500, detail=f"Ошибка отправки контакта: {error_msg}")
-
+   
 # ==================== Остальные эндпоинты (без изменений) ====================
 async def incoming_handler(event):
     if event.is_outgoing:
@@ -947,6 +962,7 @@ async def get_chat_history(req: GetChatHistoryReq):
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("telegram_bot:app", host="0.0.0.0", port=port, reload=False)
+
 
 
 
